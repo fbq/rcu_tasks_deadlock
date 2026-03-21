@@ -28,6 +28,8 @@
 #include <bpf/bpf_tracing.h>
 
 struct task_struct;
+struct rcu_head;
+typedef void (*rcu_callback_t)(struct rcu_head *);
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -59,11 +61,11 @@ struct timer_list {
 } __attribute__((preserve_access_index));
 
 /*
- * Per-CPU one-shot flag: set to 1 after we successfully delete task storage
- * on this CPU (i.e. after call_rcu_tasks_trace() has been triggered here).
- * Using PERCPU_ARRAY lets each CPU fire independently, so every CPU gets
- * one chance to trigger the deadlock.  Prevents re-entry from the
- * mod_timer() call inside call_rcu_tasks_generic() on the same CPU.
+ * Per-CPU one-shot flag (key=0):
+ *   0      not yet triggered on this CPU
+ *   != 0   triggered; value encodes pid (pid = value - 1)
+ *
+ * PERCPU_ARRAY so each CPU fires independently.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -73,8 +75,24 @@ struct {
 } done SEC(".maps");
 
 /*
- * Task local storage: deleted inside tp_btf/timer_start (while base->lock
- * is held) to reach call_rcu_tasks_trace() via:
+ * Per-CPU flag: set while inside call_rcu_tasks_trace() on this CPU.
+ *
+ * call_rcu_tasks_generic() holds rtpcp->lock and calls mod_timer(lazy_timer),
+ * which fires tp_btf/timer_start again.  Without this guard, probe_timer_start
+ * would call bpf_task_storage_delete() -> call_rcu_tasks_trace() a second time
+ * while rtpcp->lock is already held, causing a different deadlock instead of
+ * the timer-base-lock deadlock we want to demonstrate.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} in_rcu_trace SEC(".maps");
+
+/*
+ * Task local storage: created and immediately deleted inside tp_btf/timer_start
+ * (while base->lock is held) to reach call_rcu_tasks_trace() via:
  *   bpf_selem_unlink(selem, reuse_now=false) -> bpf_selem_free(false)
  */
 struct {
@@ -85,11 +103,41 @@ struct {
 } task_storage SEC(".maps");
 
 /*
+ * fentry/call_rcu_tasks_trace — set in_rcu_trace on entry, clear on exit.
+ *
+ * This guards probe_timer_start against triggering while already inside
+ * call_rcu_tasks_trace() (i.e. from the mod_timer(lazy_timer) call inside
+ * call_rcu_tasks_generic()), which would cause an rtpcp->lock deadlock
+ * rather than the timer-base-lock deadlock we intend to trigger.
+ */
+SEC("fentry/call_rcu_tasks_trace")
+int BPF_PROG(enter_rcu_tasks_trace, struct rcu_head *rhp, rcu_callback_t func)
+{
+	__u32 key = 0;
+	__u64 *flag = bpf_map_lookup_elem(&in_rcu_trace, &key);
+
+	if (flag)
+		*flag = 1;
+	return 0;
+}
+
+SEC("fexit/call_rcu_tasks_trace")
+int BPF_PROG(exit_rcu_tasks_trace, struct rcu_head *rhp, rcu_callback_t func)
+{
+	__u32 key = 0;
+	__u64 *flag = bpf_map_lookup_elem(&in_rcu_trace, &key);
+
+	if (flag)
+		*flag = 0;
+	return 0;
+}
+
+/*
  * tp_btf/timer_start fires inside __mod_timer() after lock_timer_base()
  * has acquired base->lock with IRQs disabled.
  *
- * Create task storage and immediately delete it in the same invocation.
- * The delete reaches call_rcu_tasks_trace() via:
+ * Create task storage and immediately delete it to trigger call_rcu_tasks_trace().
+ * The delete reaches it via:
  *   bpf_selem_unlink(selem, reuse_now=false) -> bpf_selem_free(false)
  * If call_rcu_tasks_trace() -> mod_timer(lazy_timer) tries to re-acquire
  * base->lock on this CPU -> DEADLOCK.  If it returns, store pid+1 in done
@@ -105,6 +153,11 @@ int BPF_PROG(probe_timer_start, struct timer_list *timer,
 
 	/* Skip timers that won't use the current CPU's standard base. */
 	if (timer->flags & (TIMER_PINNED | TIMER_DEFERRABLE))
+		return 0;
+
+	/* Skip if we are already inside call_rcu_tasks_trace() on this CPU. */
+	flag = bpf_map_lookup_elem(&in_rcu_trace, &key);
+	if (!flag || *flag)
 		return 0;
 
 	flag = bpf_map_lookup_elem(&done, &key);
