@@ -75,12 +75,22 @@ int main(void)
 		goto out;
 	}
 
+	int *reported = calloc(ncpus, sizeof(*reported));
+	if (!reported) {
+		fprintf(stderr, "calloc: %s\n", strerror(errno));
+		free(values);
+		err = -ENOMEM;
+		goto out;
+	}
+
 	done_fd = bpf_map__fd(skel->maps.done);
 
 	fprintf(stderr,
-		"BPF program attached.  Waiting for trigger...\n"
+		"BPF program attached.  Waiting for all %d CPUs to report...\n"
 		"If the system freezes, the deadlock fired.\n"
-		"Ctrl-C to detach.\n\n");
+		"Ctrl-C to detach.\n\n", ncpus);
+
+	int ndone = 0;
 
 	while (!exiting) {
 		usleep(100 * 1000); /* 100 ms */
@@ -89,15 +99,23 @@ int main(void)
 			continue;
 
 		for (int cpu = 0; cpu < ncpus; cpu++) {
-			if (!values[cpu])
+			if (reported[cpu] || !values[cpu])
 				continue;
 			printf("CPU %d: call_rcu_tasks_trace() returned "
 			       "(no deadlock) — triggered by pid %llu\n",
 			       cpu, values[cpu] - 1);
-			exiting = 1;
+			reported[cpu] = 1;
+			ndone++;
 		}
+
+		if (ndone == ncpus)
+			break;
 	}
 
+	if (ndone == ncpus)
+		printf("\nAll %d CPUs reported no deadlock.\n", ncpus);
+
+	free(reported);
 	free(values);
 out:
 	rcu_tasks_deadlock_bpf__destroy(skel);
