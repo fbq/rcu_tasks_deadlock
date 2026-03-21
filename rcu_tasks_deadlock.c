@@ -59,6 +59,8 @@ int main(void)
 
 	fprintf(stderr,
 		"BPF program attached.  Triggering deadlock...\n"
+		"Each CPU fires once; watch for output in trace_pipe:\n"
+		"  cat /sys/kernel/debug/tracing/trace_pipe\n"
 		"WARNING: the kernel will hang when the deadlock fires.\n"
 		"Ctrl-C to detach before that happens.\n\n");
 

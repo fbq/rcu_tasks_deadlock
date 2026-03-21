@@ -59,13 +59,14 @@ struct timer_list {
 } __attribute__((preserve_access_index));
 
 /*
- * One-shot flag: set to 1 after we successfully delete task storage
- * (i.e. after call_rcu_tasks_trace() has been triggered).  Prevents
- * the mod_timer() call inside call_rcu_tasks_generic() from re-entering
- * this probe and looping.
+ * Per-CPU one-shot flag: set to 1 after we successfully delete task storage
+ * on this CPU (i.e. after call_rcu_tasks_trace() has been triggered here).
+ * Using PERCPU_ARRAY lets each CPU fire independently, so every CPU gets
+ * one chance to trigger the deadlock.  Prevents re-entry from the
+ * mod_timer() call inside call_rcu_tasks_generic() on the same CPU.
  */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, __u64);
@@ -114,6 +115,10 @@ int BPF_PROG(probe_timer_start, struct timer_list *timer,
 	if (bpf_task_storage_delete(&task_storage, task) == 0) {
 		/* Successfully deleted: call_rcu_tasks_trace() is in flight. */
 		*flag = 1;
+		bpf_printk("CPU %u pid %u: triggered call_rcu_tasks_trace() "
+			   "while timer base lock held\n",
+			   bpf_get_smp_processor_id(),
+			   (__u32)(bpf_get_current_pid_tgid() >> 32));
 	} else {
 		/* -ENOENT: no storage yet; seed it for the next invocation. */
 		val = bpf_task_storage_get(&task_storage, task, 0,
