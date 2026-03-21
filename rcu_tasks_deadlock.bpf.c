@@ -10,7 +10,7 @@
  *   __mod_timer()
  *     lock_timer_base()
  *       raw_spin_lock_irqsave(&base->lock)   <- base->lock ACQUIRED
- *     trace_timer_start()                    <- tp_btf/timer_start fires here
+ *     trace_timer_start(timer, bucket_expiry) <- tp_btf/timer_start fires here
  *       [probe_timer_start BPF program]
  *         bpf_task_storage_delete()
  *           bpf_selem_unlink(selem, false)
@@ -27,7 +27,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-struct timer_list;
 struct task_struct;
 
 char LICENSE[] SEC("license") = "GPL";
@@ -43,6 +42,21 @@ char LICENSE[] SEC("license") = "GPL";
  */
 #define TIMER_PINNED		0x00000001
 #define TIMER_DEFERRABLE	0x00000002
+
+/*
+ * Minimal struct timer_list covering the fields we read.
+ * preserve_access_index lets libbpf CO-RE adjust offsets at load time.
+ */
+struct hlist_node {
+	struct hlist_node *next, **pprev;
+};
+
+struct timer_list {
+	struct hlist_node	entry;
+	unsigned long		expires;
+	void			(*function)(struct timer_list *);
+	unsigned int		flags;
+} __attribute__((preserve_access_index));
 
 /*
  * One-shot flag: set to 1 after we successfully delete task storage
@@ -83,14 +97,14 @@ struct {
  */
 SEC("tp_btf/timer_start")
 int BPF_PROG(probe_timer_start, struct timer_list *timer,
-	     unsigned long expires, unsigned int flags)
+	     unsigned long bucket_expiry)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	__u32 key = 0;
 	__u64 *flag, *val;
 
 	/* Skip timers that won't use the current CPU's standard base. */
-	if (flags & (TIMER_PINNED | TIMER_DEFERRABLE))
+	if (timer->flags & (TIMER_PINNED | TIMER_DEFERRABLE))
 		return 0;
 
 	flag = bpf_map_lookup_elem(&done, &key);
