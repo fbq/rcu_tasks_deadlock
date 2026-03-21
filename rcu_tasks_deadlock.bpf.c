@@ -88,13 +88,12 @@ struct {
  * tp_btf/timer_start fires inside __mod_timer() after lock_timer_base()
  * has acquired base->lock with IRQs disabled.
  *
- * Phase 1 (first invocation, no storage yet):
- *   bpf_task_storage_delete() returns -ENOENT -> seed storage for next call.
- *
- * Phase 2 (second invocation, storage exists):
- *   bpf_task_storage_delete() succeeds -> call_rcu_tasks_trace() triggered
- *   -> call_rcu_tasks_generic() -> mod_timer(lazy_timer) -> re-fires this
- *   tracepoint, but done=1 so the probe exits immediately.
+ * Create task storage and immediately delete it in the same invocation.
+ * The delete reaches call_rcu_tasks_trace() via:
+ *   bpf_selem_unlink(selem, reuse_now=false) -> bpf_selem_free(false)
+ * If call_rcu_tasks_trace() -> mod_timer(lazy_timer) tries to re-acquire
+ * base->lock on this CPU -> DEADLOCK.  If it returns, store pid+1 in done
+ * so userspace can detect the non-deadlock outcome.
  */
 SEC("tp_btf/timer_start")
 int BPF_PROG(probe_timer_start, struct timer_list *timer,
@@ -102,7 +101,7 @@ int BPF_PROG(probe_timer_start, struct timer_list *timer,
 {
 	struct task_struct *task = bpf_get_current_task_btf();
 	__u32 key = 0;
-	__u64 *flag, *val;
+	__u64 *flag;
 
 	/* Skip timers that won't use the current CPU's standard base. */
 	if (timer->flags & (TIMER_PINNED | TIMER_DEFERRABLE))
@@ -112,20 +111,14 @@ int BPF_PROG(probe_timer_start, struct timer_list *timer,
 	if (!flag || *flag)
 		return 0;
 
+	/* Create storage then immediately delete it to trigger call_rcu_tasks_trace(). */
+	if (!bpf_task_storage_get(&task_storage, task, 0,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE))
+		return 0;
+
 	if (bpf_task_storage_delete(&task_storage, task) == 0) {
-		/*
-		 * Delete returned -> call_rcu_tasks_trace() did NOT deadlock.
-		 * Store pid+1 so userspace can detect this and extract the pid.
-		 * (0 is reserved for "not yet triggered".)
-		 */
 		__u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
 		*flag = (__u64)pid + 1;
-	} else {
-		/* -ENOENT: no storage yet; seed it for the next invocation. */
-		val = bpf_task_storage_get(&task_storage, task, 0,
-					   BPF_LOCAL_STORAGE_GET_F_CREATE);
-		if (val)
-			*val = bpf_ktime_get_ns();
 	}
 
 	return 0;
