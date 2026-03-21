@@ -33,6 +33,18 @@ struct task_struct;
 char LICENSE[] SEC("license") = "GPL";
 
 /*
+ * Timer flags from include/linux/timer.h.  We only want timers that use
+ * the current CPU's standard (BASE_STD) timer base, which is the same base
+ * that call_rcu_tasks_generic() uses for rtpcp->lazy_timer.
+ *
+ * TIMER_DEFERRABLE timers go to BASE_DEF (different lock -> no deadlock).
+ * TIMER_PINNED timers may be pinned to a different CPU's base.
+ * Skip both so we only instrument timers on the current CPU's STD base.
+ */
+#define TIMER_PINNED		0x00000001
+#define TIMER_DEFERRABLE	0x00000002
+
+/*
  * One-shot flag: set to 1 after we successfully delete task storage
  * (i.e. after call_rcu_tasks_trace() has been triggered).  Prevents
  * the mod_timer() call inside call_rcu_tasks_generic() from re-entering
@@ -76,6 +88,10 @@ int BPF_PROG(probe_timer_start, struct timer_list *timer,
 	struct task_struct *task = bpf_get_current_task_btf();
 	__u32 key = 0;
 	__u64 *flag, *val;
+
+	/* Skip timers that won't use the current CPU's standard base. */
+	if (flags & (TIMER_PINNED | TIMER_DEFERRABLE))
+		return 0;
 
 	flag = bpf_map_lookup_elem(&done, &key);
 	if (!flag || *flag)
