@@ -33,9 +33,22 @@ struct task_struct;
 char LICENSE[] SEC("license") = "GPL";
 
 /*
+ * One-shot flag: set to 1 after we successfully delete task storage
+ * (i.e. after call_rcu_tasks_trace() has been triggered).  Prevents
+ * the mod_timer() call inside call_rcu_tasks_generic() from re-entering
+ * this probe and looping.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} done SEC(".maps");
+
+/*
  * Task local storage: deleted inside tp_btf/timer_start (while base->lock
- * is held) to trigger bpf_selem_free(false) -> call_rcu_tasks_trace() ->
- * call_rcu_tasks_generic() -> mod_timer(lazy_timer) -> DEADLOCK.
+ * is held) to reach call_rcu_tasks_trace() via:
+ *   bpf_selem_unlink(selem, reuse_now=false) -> bpf_selem_free(false)
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
@@ -46,24 +59,38 @@ struct {
 
 /*
  * tp_btf/timer_start fires inside __mod_timer() after lock_timer_base()
- * has acquired base->lock with IRQs disabled.  Deleting the task storage
- * entry here unconditionally reaches call_rcu_tasks_trace() via:
- *   bpf_selem_unlink(selem, reuse_now=false) -> bpf_selem_free(false)
- * Re-seeding ensures the next invocation can delete again.
+ * has acquired base->lock with IRQs disabled.
+ *
+ * Phase 1 (first invocation, no storage yet):
+ *   bpf_task_storage_delete() returns -ENOENT -> seed storage for next call.
+ *
+ * Phase 2 (second invocation, storage exists):
+ *   bpf_task_storage_delete() succeeds -> call_rcu_tasks_trace() triggered
+ *   -> call_rcu_tasks_generic() -> mod_timer(lazy_timer) -> re-fires this
+ *   tracepoint, but done=1 so the probe exits immediately.
  */
 SEC("tp_btf/timer_start")
 int BPF_PROG(probe_timer_start, struct timer_list *timer,
 	     unsigned long expires, unsigned int flags)
 {
 	struct task_struct *task = bpf_get_current_task_btf();
-	__u64 *val;
+	__u32 key = 0;
+	__u64 *flag, *val;
 
-	bpf_task_storage_delete(&task_storage, task);
+	flag = bpf_map_lookup_elem(&done, &key);
+	if (!flag || *flag)
+		return 0;
 
-	val = bpf_task_storage_get(&task_storage, task, 0,
-				   BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (val)
-		*val = bpf_ktime_get_ns();
+	if (bpf_task_storage_delete(&task_storage, task) == 0) {
+		/* Successfully deleted: call_rcu_tasks_trace() is in flight. */
+		*flag = 1;
+	} else {
+		/* -ENOENT: no storage yet; seed it for the next invocation. */
+		val = bpf_task_storage_get(&task_storage, task, 0,
+					   BPF_LOCAL_STORAGE_GET_F_CREATE);
+		if (val)
+			*val = bpf_ktime_get_ns();
+	}
 
 	return 0;
 }
