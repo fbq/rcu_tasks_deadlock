@@ -113,12 +113,13 @@ int BPF_PROG(probe_timer_start, struct timer_list *timer,
 		return 0;
 
 	if (bpf_task_storage_delete(&task_storage, task) == 0) {
-		/* Successfully deleted: call_rcu_tasks_trace() is in flight. */
-		*flag = 1;
-		bpf_printk("CPU %u pid %u: triggered call_rcu_tasks_trace() "
-			   "while timer base lock held\n",
-			   bpf_get_smp_processor_id(),
-			   (__u32)(bpf_get_current_pid_tgid() >> 32));
+		/*
+		 * Delete returned -> call_rcu_tasks_trace() did NOT deadlock.
+		 * Store pid+1 so userspace can detect this and extract the pid.
+		 * (0 is reserved for "not yet triggered".)
+		 */
+		__u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+		*flag = (__u64)pid + 1;
 	} else {
 		/* -ENOENT: no storage yet; seed it for the next invocation. */
 		val = bpf_task_storage_get(&task_storage, task, 0,

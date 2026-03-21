@@ -6,8 +6,9 @@
  * Run:    sudo ./rcu_tasks_deadlock
  *
  * Loads and attaches the BPF program that triggers the RCU Tasks Trace /
- * timer-base-lock deadlock.  The kernel will hang when the deadlock fires.
- * Run only inside a VM.
+ * timer-base-lock deadlock.  Polls the per-CPU done map and exits when
+ * call_rcu_tasks_trace() has completed on at least one CPU without
+ * deadlocking.  If the system freezes instead, the deadlock fired.
  */
 #include <errno.h>
 #include <signal.h>
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "rcu_tasks_deadlock.skel.h"
 
 static volatile int exiting;
@@ -37,7 +39,9 @@ static int libbpf_quiet(enum libbpf_print_level level,
 int main(void)
 {
 	struct rcu_tasks_deadlock_bpf *skel;
-	int err;
+	int ncpus, done_fd, err = 0;
+	__u64 *values;
+	__u32 key = 0;
 
 	libbpf_set_print(libbpf_quiet);
 
@@ -57,16 +61,44 @@ int main(void)
 		goto out;
 	}
 
+	ncpus = libbpf_num_possible_cpus();
+	if (ncpus < 0) {
+		fprintf(stderr, "libbpf_num_possible_cpus: %d\n", ncpus);
+		err = ncpus;
+		goto out;
+	}
+
+	values = calloc(ncpus, sizeof(*values));
+	if (!values) {
+		fprintf(stderr, "calloc: %s\n", strerror(errno));
+		err = -ENOMEM;
+		goto out;
+	}
+
+	done_fd = bpf_map__fd(skel->maps.done);
+
 	fprintf(stderr,
-		"BPF program attached.  Triggering deadlock...\n"
-		"Each CPU fires once; watch for output in trace_pipe:\n"
-		"  cat /sys/kernel/debug/tracing/trace_pipe\n"
-		"WARNING: the kernel will hang when the deadlock fires.\n"
-		"Ctrl-C to detach before that happens.\n\n");
+		"BPF program attached.  Waiting for trigger...\n"
+		"If the system freezes, the deadlock fired.\n"
+		"Ctrl-C to detach.\n\n");
 
-	while (!exiting)
-		pause();
+	while (!exiting) {
+		usleep(100 * 1000); /* 100 ms */
 
+		if (bpf_map_lookup_elem(done_fd, &key, values) < 0)
+			continue;
+
+		for (int cpu = 0; cpu < ncpus; cpu++) {
+			if (!values[cpu])
+				continue;
+			printf("CPU %d: call_rcu_tasks_trace() returned "
+			       "(no deadlock) — triggered by pid %llu\n",
+			       cpu, values[cpu] - 1);
+			exiting = 1;
+		}
+	}
+
+	free(values);
 out:
 	rcu_tasks_deadlock_bpf__destroy(skel);
 	return err ? 1 : 0;
